@@ -24,8 +24,10 @@ it is a change to the version: a 1.x adds keys and never removes or renames one;
 either.
 
 The document is JSON. Keys are `snake_case`, as in the two source formats, and are written in the
-order this page lists them. Times are unix milliseconds, read from the `.sd` record a node
-references; a view is read and never digested, so it carries no RFC 3339 strings. The same head
+order this page lists them. Times are unix milliseconds, rounded down, read from the `.sd` record a
+node references; a view is read and never digested, so it carries no RFC 3339 strings. A time a
+round's header carries is null when the header has none, and 0 when its value is not a time as
+[Reading a record](session-data.md#reading-a-record) defines one. The same head
 round over the same files gives the same document, so one built by `asz view` and one built by
 another server compare equal as documents.
 
@@ -80,7 +82,7 @@ producer of them.
 | `streams` | one per execution stream: `id`, `name`, `role` (`main` or `child`), `label`, `parent`, `records`, `steps`, `talk`, `named_by`, and `opened_by`, every step the assembler could tie to the start of the stream as `{step, stream, talk, quality}`, in the order those steps happened; several means it did not choose, and neither does a view |
 | `segments` | one per activity window: `id`, `state`, `committable`, `talks`, `from`, `to` |
 | `talks` | one tree per talk, in time order. See the node below |
-| `loose` | the runs and steps no talk contains, as trees from their highest such ancestor: a child's output the fold parented to the session because the child's stream opened no talk, for instance. Empty for most conversations. With `talks`, it holds every run and step of the fold, so the document covers the whole session |
+| `loose` | the runs and steps no talk contains, as trees from their highest such ancestor: a child's output the fold parented to the session because the child's stream opened no talk, for instance. Empty for most conversations. With `talks`, it holds every run and step of the fold within twelve levels of its root, so the document covers the whole session |
 | `relations` | one per relation of the fold: `id`, `type`, `from`, `to`, `quality`, `via`, `evidence`; in the order they happened, each at the earliest record its evidence names |
 | `unresolved` | one per reference the assembler could not resolve, open or since resolved: `id`, `kind`, `ref`, `reason`, `state` |
 | `workspace_changes` | one per workspace change record the session's files carry, joined to its step. See below. |
@@ -97,11 +99,13 @@ A stream's `opened_by`, the `relations` list and a node's `edges` are in the ord
 never in the order of an id. Inside one stream or one workflow run, a record's position orders it:
 its file's `seq`, then its `row`, then its `block`. A position means nothing across streams, since a
 child's file can land before its parent's, so streams and runs are merged by time: each next item is
-the earliest of the next items of every stream, a timed item before an untimed one. An item several
+the earliest of the next items of every stream, a timed item before an untimed one. Times compare as
+the instants they name, as [Reading a record](session-data.md#reading-a-record) says. An item several
 records support, such as a relation, happened at the earliest of them by the same rule. Each list is
 ordered on its own. An id decides only between items that one record supports, such as two relations
-with the same evidence. Talks, workspace changes and tool executions are in time order, as their own
-sections say.
+with the same evidence, and ids compare in code point order, as [Session Flow](session-flow.md#header)
+defines it. Talks, workspace changes and tool executions are in time order, as their own sections
+say.
 
 ## A node in `talks`
 
@@ -118,20 +122,30 @@ sections say.
 
 | Key | Value |
 | --- | --- |
-| `id`, `kind`, `parent`, `stream`, `attrs` | the node as the fold holds it; `kind` is one of the node kinds of Session Flow |
+| `id`, `kind`, `parent`, `stream`, `attrs` | the node as the fold holds it; `kind` is one of the node kinds of Session Flow; `attrs` is as the round wrote it, numbers included, without `provider_bodies`, which a call gives under a key of its own |
 | `at` | when its record happened, from the record; `0` when nothing observed it |
 | `ref`, `refs` | the record it stands on and every record it covers, as `{seq, row, block}`, kept so a viewer can show the evidence |
-| `text`, `state`, `bytes` | the part the node stands on: its readable text, clipped to the longest prefix of whole characters within 2,000 bytes, whether the content is `available`, and its full size. For a `data` part the text is the data as compact JSON. Earlier writers put `\u003c`, `\u003e` and `\u0026` there for `<`, `>` and `&`, so their step text can differ (see [What data holds](session-data.md#what-data-holds)). A reader wanting the whole record reads it by address. |
-| `usage`, `flags`, `dropped` | what else the referenced record says, copied once: on an `llm.call`, the token counts `in`, `out`, `cache_read`, `cache_write` from the one record `usage_at` names, never a sum over fragments; the record's `flags`; and its `dropped` list, so a viewer can say what was left out and why |
+| `text`, `state`, `bytes` | the part the node stands on: its readable text, clipped to the longest prefix of whole characters within 2,000 bytes, whether the content is `available`, and its full size. For a `data` part the text is the record's readable text when it has one: its `text` parts, or the prompt inside a `queued_command` envelope, the form a message typed while the agent works arrives in. Otherwise it is the data exactly as the record holds it, which is compact JSON. Earlier writers put `\u003c`, `\u003e` and `\u0026` there for `<`, `>` and `&`, so their step text can differ (see [What data holds](session-data.md#what-data-holds)). A reader wanting the whole record reads it by address. |
+| `usage`, `flags`, `dropped` | what else the referenced record says, copied once: on an `llm.call`, the token counts `in`, `out`, `cache_read`, `cache_write` from the one record `usage_at` names, never a sum over fragments, a count of zero left out; the record's `flags`; and its `dropped` list, each entry its `what` and `bytes`, and `why` when there is one, so a viewer can say what was left out and why. A field the Session Data page does not list is not copied |
 | a talk adds | `label` and `reply`, clipped the same way and described below, then `runs`, `steps`, `tools`, `from`, `to`, `child`, `segment` |
 | a tool or agent call adds | `name`, `failed`, `result`, `result_state`, `result_bytes`, `request_to_result_ms` and `request_to_result_join`, the time from the request record to the result record where the assembler joined them exactly; `changes` and `executions`, the records joined to it |
 | a call to an MCP server has in `attrs` | `mcp_server` and `mcp_tool`, the server and the tool the runtime's name for the call addresses, where the name splits exactly (see [Parts](session-data.md#parts)). They are the runtime's names; which server ran the call, by its configured name, is in the call's execution record |
 | a `turn.duration` step adds | `duration_ms`, `duration_measured_by` |
-| `children` | containment, in record order: a talk holds runs, a run holds steps, a call holds what it produced |
+| `children` | containment, in record order: a talk holds runs, a run holds steps, a call holds what it produced. A tree is written down to twelve levels below its root, a talk or an entry of `loose`, and a node deeper than that is left out. No talk measured has more than three |
 | `edges` | every relation touching the node, in both directions, as `{type, other, dir, quality, via}`, in the order the relations happened, each at the earliest record its evidence names, so a viewer draws cross-stream flow without searching `relations`; a workflow launch lists the streams it started in the order its run names them |
 
 Keys a node has no value for are absent, not null. Nothing in a document is inferred beyond what
 the fold and the records say. Where the fold says `unavailable`, the document says it too.
+
+Where the document trims white space from a text, or turns a run of it into one space, white space
+is what Unicode's `White_Space` property lists. A no-break space is white space.
+
+**A call's result.** A tool or agent call's first reference is its request, and its other
+references name what came back. They are read in order until one gives the call a `result`. From
+each, the part read is the one its `block` names, or else the record's first `result` part; a
+record with neither gives nothing. The `result` is that part's `text`, or its `data` when it has no
+text. Each part read sets `result_state` and `result_bytes`, even when it has neither. `failed`
+comes from the first part that has it, the request's included.
 
 **A talk's label and reply.** A talk's `label` is the text of the first `message.external` step in
 it. A talk can have none. A talk opened by a command typed locally is one example, because the
@@ -145,7 +159,8 @@ earlier messages are what the agent said between tool calls, as the
 explains. Either key is absent when no step gives it a text.
 
 **Request to result is not tool time.** `request_to_result_ms` is the time between two records the
-runtime wrote, the request and its result, tied together by the tool-use id. It is not how long the
+runtime wrote, the request and its result, tied together by the tool-use id: the difference of
+their times, in whole milliseconds, with the rest dropped. It is not how long the
 tool ran. It can include waiting and other work between the two records. So `timing` in `attrs`
 stays `unavailable` beside it, for the reason the
 [Claude Code adapter](../adapters/claude-code.md#step-mapping) gives. Both keys are absent when the
