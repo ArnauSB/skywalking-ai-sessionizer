@@ -19,15 +19,20 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/apache/skywalking-ai-sessionizer/pkg/sessiondata"
 )
 
 // Config is the top-level configuration document.
@@ -37,6 +42,23 @@ type Config struct {
 	Parse    Parse     `yaml:"parse"`
 	Metrics  Metrics   `yaml:"metrics"`
 	Export   Export    `yaml:"export"`
+	View     View      `yaml:"view"`
+}
+
+// View configures what asz view and asz server serve.
+type View struct {
+	// Hide lists the flags whose steps the page withholds from every
+	// reader: system_prompt, the system prompt a runtime sent, and
+	// tool_schemas, the schemas of the tools it advertised. A withheld step
+	// keeps its place, its flags and its size, loses its text, and says so
+	// with the state omitted. The provider bodies go with it, since a
+	// request carries both again and a body is served whole or not at all.
+	// A host that serves the API through its own route withholds more for
+	// one reader with the hide parameter, never less. asz knows nothing
+	// about who is reading: one instance per audience, each behind the
+	// deployment's own authentication, is how two audiences are served.
+	// Empty hides nothing.
+	Hide []string `yaml:"hide"`
 }
 
 // Metrics configures what asz derives from the landed files. It is one
@@ -360,6 +382,7 @@ func Default() *Config {
 			Logs:       boolPtr(true),
 			Metrics:    boolPtr(true),
 		}},
+		View: View{Hide: []string{}},
 	}
 }
 
@@ -402,6 +425,9 @@ func Load(path string) (*Config, error) {
 	var loaded Config
 	if err := yaml.Unmarshal(data, &loaded); err != nil {
 		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+	}
+	if err := checkKeys(data); err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
 	}
 	if loaded.Storage.Root != "" {
 		cfg.Storage.Root = loaded.Storage.Root
@@ -459,7 +485,66 @@ func Load(path string) (*Config, error) {
 	if o.Metrics != nil {
 		cfg.Export.OTLP.Metrics = o.Metrics
 	}
+	if len(loaded.View.Hide) > 0 {
+		// hide is a set, and a name written twice is withheld once.
+		cfg.View.Hide = slices.Compact(slices.Sorted(slices.Values(loaded.View.Hide)))
+	}
 	return cfg, cfg.Validate()
+}
+
+// checkKeys refuses a configuration that would show a reader what it meant
+// to withhold, with no word said.
+//
+// Every section but view is read loosely, as it always was. view is not,
+// because it says what a reader is kept from, and a misspelled key there
+// would show everything to everyone. The YAML library resolves aliases and
+// merge keys here as it does for the whole configuration, so view reads the
+// same in both.
+//
+// Only the first YAML document of a file is read, so a later one that holds
+// anything is refused rather than ignored.
+func checkKeys(data []byte) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	var top struct {
+		View View `yaml:"view"`
+		// Rest holds every other top-level key as a node, not decoded, so an
+		// alias in a key nothing reads is not expanded here, as the
+		// configuration itself does not expand it.
+		Rest map[string]yaml.Node `yaml:",inline"`
+	}
+	if err := dec.Decode(&top); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		// The library names a Go type a person editing the file has never
+		// seen.
+		return errors.New(strings.NewReplacer(": field ", ": ", " not found in type config.View",
+			" is not a key of the view section").Replace(err.Error()))
+	}
+	for {
+		var next yaml.Node
+		err := dec.Decode(&next)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || holdsAnything(&next) {
+			return errors.New("the file holds a second YAML document, and only the first is read. " +
+				"Write the configuration as one document")
+		}
+	}
+	return nil
+}
+
+// holdsAnything reports whether a YAML document holds a value. A document
+// with nothing after its marker holds a null.
+func holdsAnything(doc *yaml.Node) bool {
+	for _, n := range doc.Content {
+		if n.Kind != yaml.ScalarNode || n.ShortTag() != "!!null" {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Collector) applyDefaults() {
@@ -560,6 +645,9 @@ func (c *Config) Validate() error {
 	}
 	if _, err := c.Metrics.LookbackDuration(); err != nil {
 		return err
+	}
+	if err := sessiondata.CheckWithholdable(c.View.Hide); err != nil {
+		return fmt.Errorf("config: view.hide: %w", err)
 	}
 	return nil
 }

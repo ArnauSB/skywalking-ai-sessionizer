@@ -22,9 +22,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -38,14 +40,15 @@ import (
 	"github.com/apache/skywalking-ai-sessionizer/pkg/sessionview"
 )
 
-// apiView serves the whole conversation as one asz.view document.
-func (s *Server) apiView(w http.ResponseWriter, id string) {
+// apiView serves the whole conversation as one asz.view document, less what
+// this reader withholds.
+func (s *Server) apiView(w http.ResponseWriter, id string, hide []string) {
 	c, err := s.Load(id)
 	if err != nil {
 		fail(w, err, http.StatusNotFound)
 		return
 	}
-	v, err := c.Build()
+	v, err := c.BuildWithheld(hide)
 	if err != nil {
 		fail(w, err, http.StatusInternalServerError)
 		return
@@ -70,12 +73,45 @@ func (s *Server) apiView(w http.ResponseWriter, id string) {
 // each verified. It is made once per fold. The records every tree needs
 // are read in one pass per landed file rather than one per talk.
 func (c *Conversation) Build() (*sessionview.Conversation, error) {
+	return c.BuildWithheld(nil)
+}
+
+// BuildWithheld is Build with the records carrying any of the named flags
+// withheld, as withhold.go says. Each set of names is built once per fold
+// and kept for the next reader with the same names. A name that is not a flag
+// a reader may withhold is refused, since withholding by it would withhold
+// nothing and say it had.
+//
+// A withheld document is built from records withheld as they are read, not
+// by clearing a whole document afterwards. Every field read from a record,
+// a step's text, a tool's result, a talk's label or reply, then follows the
+// rule, including fields added later.
+func (c *Conversation) BuildWithheld(names []string) (*sessionview.Conversation, error) {
+	if err := sessiondata.CheckWithholdable(names); err != nil {
+		return nil, fmt.Errorf("view: hide: %w", err)
+	}
+	names = withheldNames(names)
+	key := strings.Join(names, ",")
 	c.builtMu.Lock()
 	defer c.builtMu.Unlock()
-	if c.built != nil {
-		return c.built, nil
+	if v := c.built[key]; v != nil {
+		return v, nil
 	}
-	o := c.overview()
+	v, err := c.build(names)
+	if err != nil {
+		return nil, err
+	}
+	if c.built == nil {
+		c.built = map[string]*sessionview.Conversation{}
+	}
+	c.built[key] = v
+	return v, nil
+}
+
+// build makes the document, with every record carrying one of the named
+// flags withheld as it is read.
+func (c *Conversation) build(hide []string) (*sessionview.Conversation, error) {
+	o := c.overview(hide)
 	v := &sessionview.Conversation{
 		Format: sessionview.Format, Version: sessionview.Version,
 		Conversation: c.ID, Sessions: c.sessions(),
@@ -84,6 +120,7 @@ func (c *Conversation) Build() (*sessionview.Conversation, error) {
 		Summary: sessionview.Summary{
 			Title: o.title, Problems: []string{},
 			Kinds: o.kinds, RelationTypes: o.rels, Quality: o.quality,
+			Withheld: map[string]int{},
 		},
 		Streams: o.streams, Segments: o.segments,
 		Rounds: []sessionview.Round{}, Files: []sessionview.File{}, Talks: []sessionview.Node{}, Loose: []sessionview.Node{},
@@ -95,24 +132,14 @@ func (c *Conversation) Build() (*sessionview.Conversation, error) {
 		v.Summary.From, v.Summary.To = millisOf(attrString(sn, "from_time")), millisOf(attrString(sn, "through_time"))
 	}
 
-	landed, err := storage.LandedFiles(c.zone, c.Session)
+	parts, err := c.foldParts()
 	if err != nil {
 		return nil, err
 	}
-	files, digests, err := c.files(landed)
-	if err != nil {
-		return nil, err
-	}
-	rounds, roundFiles, problems, state := c.rounds(digests)
-	v.Rounds = rounds
-	v.Files = append(files, roundFiles...)
-	if len(c.problems) > 0 {
-		problems = append(append([]string{}, c.problems...), problems...)
-		if state == sessionview.StateVerified {
-			state = sessionview.StateIncomplete
-		}
-	}
-	v.Summary.State, v.Summary.Problems = state, problems
+	landed := parts.landed
+	v.Rounds = slices.Clone(parts.rounds)
+	v.Files = slices.Clone(parts.files)
+	v.Summary.State, v.Summary.Problems = parts.state, slices.Clone(parts.problems)
 
 	talks := c.Talks()
 	loose := c.looseRoots()
@@ -123,13 +150,15 @@ func (c *Conversation) Build() (*sessionview.Conversation, error) {
 	for _, n := range loose {
 		refs = append(refs, c.refsUnder(n)...)
 	}
-	recs := c.records(refs)
+	recs := c.records(refs, hide)
+	hidden := hiddenSet(hide)
+	withheld := withheldCounts(c.named, hide)
 	rows := map[string]talkRow{}
 	for _, row := range o.talks {
 		rows[row.ID] = row
 	}
 	for _, t := range talks {
-		n := c.step(t, 0, recs)
+		n := c.step(t, 0, recs, hidden)
 		if row, ok := rows[t.ID]; ok {
 			n.Label, n.Reply = row.Label, row.Reply
 			n.Runs, n.Steps, n.Tools = row.Runs, row.Steps, row.Tools
@@ -147,7 +176,7 @@ func (c *Conversation) Build() (*sessionview.Conversation, error) {
 	}
 
 	for _, n := range loose {
-		v.Loose = append(v.Loose, c.step(n, 0, recs))
+		v.Loose = append(v.Loose, c.step(n, 0, recs, hidden))
 	}
 	// In the order they happened, each at the earliest record that supports it.
 	rels := make([]*sessionflow.Relation, 0, len(c.View.Relations))
@@ -205,8 +234,48 @@ func (c *Conversation) Build() (*sessionview.Conversation, error) {
 			}
 		}
 	}
-	c.built = v
+	if len(hide) > 0 {
+		withhold(v, withheld)
+	}
 	return v, nil
+}
+
+// parts is what every document of one fold shares, whatever it withholds:
+// the landed files, their digests, the rounds checked against them, and what
+// that check found. Reading and digesting every landed file is the costly
+// part of a build, so it is done once per fold, not once per set of names a
+// reader withholds. Parts that fail to read are not kept, so the next build
+// tries again. A build clones what it takes from them, so the documents for
+// different names share no slice.
+type parts struct {
+	landed   []storage.LandedFile
+	files    []sessionview.File
+	rounds   []sessionview.Round
+	problems []string
+	state    string
+}
+
+func (c *Conversation) foldParts() (*parts, error) {
+	if c.shared != nil {
+		return c.shared, nil
+	}
+	landed, err := storage.LandedFiles(c.zone, c.Session)
+	if err != nil {
+		return nil, err
+	}
+	files, digests, err := c.files(landed)
+	if err != nil {
+		return nil, err
+	}
+	rounds, roundFiles, problems, state := c.rounds(digests)
+	if len(c.problems) > 0 {
+		problems = append(append([]string{}, c.problems...), problems...)
+		if state == sessionview.StateVerified {
+			state = sessionview.StateIncomplete
+		}
+	}
+	c.shared = &parts{landed: landed, files: append(files, roundFiles...), rounds: rounds, problems: problems, state: state}
+	return c.shared, nil
 }
 
 // looseRoots finds the runs and steps no talk contains, and returns the

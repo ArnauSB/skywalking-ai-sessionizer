@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -331,5 +332,95 @@ func TestSeveralChangeRecordersAreOneAdapterEach(t *testing.T) {
 	cfg.Adapters = append(cfg.Adapters, Adapter{Name: AdapterClaudeCodeLocal, Enabled: true, Collector: once})
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("a second local adapter was accepted: %v", err)
+	}
+}
+
+// The view section says what a reader is kept from, so a key it does not have
+// is refused rather than ignored. A hide reaches view by its own key, an
+// alias or a merge key, and only the first document of the file is read.
+func TestAMistakenViewKeyIsRefused(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		ok         bool
+	}{
+		{"hide in the view section", "view:\n  hide: [system_prompt]\n", true},
+		{"an empty view section", "view:\n", true},
+		{"no view section", "storage:\n  root: ./data\n", true},
+		{"a misspelled key", "view:\n  hidden: [system_prompt]\n", false},
+		{"a name the view cannot withhold", "view:\n  hide: [finished]\n", false},
+		{"view from an anchor kept at the top level", "x: &v {hide: [system_prompt]}\nview: *v\n", true},
+		{"a list kept at the top level for view", "hide: &h [system_prompt]\nview: {hide: *h}\n", true},
+		{"a misspelled key through an alias", "x: &v {hidden: [system_prompt]}\nview: *v\n", false},
+		{"hide merged into view", "x: &h {hide: [system_prompt]}\nview: {<<: *h}\n", true},
+		{"view merged in at the top level", "<<: {view: {hide: [system_prompt]}}\n", true},
+		{"a second document", "storage:\n  root: ./data\n---\nview:\n  hide: [system_prompt]\n", false},
+		{"a first document left empty", "---\n---\nview:\n  hide: [system_prompt]\n", false},
+		{"a document marker at the end", "view:\n  hide: [system_prompt]\n---\n", true},
+	} {
+		path := filepath.Join(t.TempDir(), "asz.yaml")
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if (err == nil) != tc.ok {
+			t.Errorf("%s: error %v, want ok %v", tc.name, err, tc.ok)
+			continue
+		}
+		// Every file that loads with a hide withholds what it says.
+		if err == nil && strings.Contains(tc.body, "system_prompt") && !slices.Contains(cfg.View.Hide, "system_prompt") {
+			t.Errorf("%s: loaded with hide %v, want system_prompt withheld", tc.name, cfg.View.Hide)
+		}
+	}
+}
+
+// Keys outside view are read as they always were: a key the configuration
+// does not have is ignored, a hide among them included, and a mapping that
+// is free to hold any key may hold one named hide. What they set is checked,
+// not only that the file loads.
+func TestKeysOutsideViewAreReadAsBefore(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		check      func(*Config) bool
+	}{
+		{"a key the configuration does not have", "version: 1\nstorage: {root: /a}\n", func(c *Config) bool { return c.Storage.Root == "/a" }},
+		{"a section spelled in capitals", "Storage:\n  root: /elsewhere\n", func(c *Config) bool { return c.Storage.Root == Default().Storage.Root }},
+		{"a section merged from an anchor", "base: &b\n  root: /b\nstorage:\n  <<: *b\n", func(c *Config) bool { return c.Storage.Root == "/b" }},
+		{"an anchor holding itself", "junk: &j [*j]\n", nil},
+		{"headers named for hide", "export:\n  otlp:\n    headers:\n      hide: \"yes\"\n      x-hide-token: abc\n",
+			func(c *Config) bool {
+				return c.Export.OTLP.Headers["hide"] == "yes" && c.Export.OTLP.Headers["x-hide-token"] == "abc"
+			}},
+		{"a hide outside view", "hide: [system_prompt]\nstorage: {root: /e}\n", func(c *Config) bool { return c.Storage.Root == "/e" && len(c.View.Hide) == 0 }},
+	} {
+		path := filepath.Join(t.TempDir(), "asz.yaml")
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(path)
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if tc.check != nil && !tc.check(cfg) {
+			t.Errorf("%s: loaded, but not as written: %+v", tc.name, cfg)
+		}
+	}
+}
+
+// A refusal names the key as spelled and its line, or the name view cannot
+// withhold.
+func TestARefusedViewKeySaysWhere(t *testing.T) {
+	for _, tc := range []struct{ name, body, want string }{
+		{"a key the view section does not have", "view:\n  hidden: [system_prompt]\n", "line 2: hidden is not a key of the view section"},
+		{"a name the view cannot withhold", "view: {hide: [\"system_prompt,tool_schemas\"]}\n", `view.hide: "system_prompt,tool_schemas" is not a flag`},
+	} {
+		path := filepath.Join(t.TempDir(), "asz.yaml")
+		if err := os.WriteFile(path, []byte(tc.body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: the refusal is %v, want it to say %q", tc.name, err, tc.want)
+		}
 	}
 }

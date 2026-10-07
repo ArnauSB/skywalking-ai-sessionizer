@@ -133,6 +133,33 @@ export:
 | `logs` | `true` | Send the collected files and rounds. |
 | `metrics` | `true` | Send the metrics. `logs` or `metrics` must be on. |
 
+## view
+
+What `asz view` and `asz server` serve. asz knows nothing about who is reading, so these apply to
+every reader of the instance. Two audiences are two instances over the same root, each behind the
+deployment's own authentication. Or one host serves the API through its own route, and adds `hide`
+to every request for a reader who may not see it. See
+[Withholding](../formats/asz-view.md#withholding).
+
+A key this section does not have is refused, and the refusal names the key and its line. Every
+other section is read loosely, as it always was. This one says what a reader is kept from, so a
+misspelled key here would otherwise show everything to everyone.
+
+`hide` is read only inside `view`, written there or reached by an alias or a merge key. Written
+anywhere else, such as at the top level or under a misspelled `view`, it is one more key the
+configuration does not have: ignored, and withholding nothing.
+
+Only the first YAML document of a file is read, so a file with a later document that holds anything
+is refused. `view` is read from 0.6.0. An older asz ignores it, and withholds nothing.
+
+When `hide` is set, `asz view` and `asz server` say so as they start. A record is named for what it
+carries when it lands, so a root collected before asz named these records carries no names, and
+withholds nothing. Collect it again into a new root to withhold there.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `hide` | `[]` | The flags whose steps the page withholds from every reader: `system_prompt`, `tool_schemas`. A withheld step keeps its place, its flags and its size, loses its text, and has state `omitted`. The provider bodies go with it, because a request carries both again. |
+
 ## The changes adapter
 
 `changes` collects the records `asz-changes` writes: what each tool call changed on disk, for

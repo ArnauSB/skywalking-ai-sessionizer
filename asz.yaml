@@ -258,7 +258,7 @@ export:
     service_name: ""
     # Sent as service.instance.id: who is pushing, in words the people
     # reading the receiver recognise. Put your mailbox, your name, or the
-    # machine here, for example wusheng@tetrate.io or build-runner-3. Empty
+    # machine here, for example alice@example.org or build-runner-3. Empty
     # means user@host of the machine running asz push, which is stable
     # across restarts. The session a record belongs to is on the record
     # itself, as asz.session.
@@ -283,3 +283,18 @@ export:
     # one and not the other is sent what it takes; both off is refused.
     logs: true
     metrics: true
+
+# What asz view and asz server serve. asz knows nothing about who is
+# reading: these settings apply to every reader of this instance, and two
+# audiences are two instances over the same root, each behind the
+# deployment's own authentication.
+view:
+  # The flags whose steps the page withholds from every reader:
+  # system_prompt, the system prompt a runtime sent, and tool_schemas, the
+  # schemas of the tools it advertised. A withheld step keeps its place,
+  # its flags and its size, loses its text, and says so with the state
+  # omitted. The provider bodies go with it, since a request carries both
+  # again and a body is served whole or not at all. A host that serves the
+  # API through its own route withholds more for one reader with the hide
+  # parameter, never less. Empty hides nothing.
+  hide: []

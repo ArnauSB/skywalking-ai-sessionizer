@@ -28,6 +28,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -293,6 +294,16 @@ type View struct {
 	ProviderFiles   *int `yaml:"provider_files"`
 	ProviderBodies  *int `yaml:"provider_bodies"`
 	CapturedPrompts *int `yaml:"captured_prompts"`
+	// Flags counts the document's steps by each flag they carry, so a
+	// scenario can say which records landed named.
+	Flags map[string]int `yaml:"flags"`
+	// Hide builds the document with these flags withheld, as a view
+	// configured or asked to hide them does, and Withheld is what its
+	// summary must then count, every key of it, zeros included. Every step
+	// carrying a hidden flag must have lost its text and say omitted, and
+	// no call may list a body.
+	Hide     []string       `yaml:"hide"`
+	Withheld map[string]int `yaml:"withheld"`
 }
 
 // Talk is what a talk in the document must say.
@@ -529,12 +540,99 @@ func checkView(root, session string, want *View) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	doc, err := c.Build()
+	doc, err := c.BuildWithheld(want.Hide)
 	if err != nil {
 		return nil, err
 	}
 	var out []string
 	bad := func(format string, a ...any) { out = append(out, fmt.Sprintf(format, a...)) }
+	whole := doc
+	if len(want.Hide) > 0 {
+		if whole, err = c.Build(); err != nil {
+			return nil, err
+		}
+	}
+	// An injection that is what the runtime sent the model never names a
+	// talk, in any document, so a reader shown the whole one never sees it
+	// as a title either. A person's input names its talk whatever it
+	// carries, so only injections are searched for, and only talks with no
+	// input of their own, which are the ones an injection can name.
+	var sent []string
+	eachNode(whole, func(n *sessionview.Node) {
+		if text := strings.TrimSpace(n.Text); text != "" && n.Kind == model.KindContextInjection &&
+			slices.ContainsFunc(n.Flags, sessiondata.IsWithholdable) {
+			sent = append(sent, text)
+		}
+	})
+	eachNode(whole, func(n *sessionview.Node) {
+		label := strings.TrimSpace(n.Label)
+		if label == "" || holdsKind(n, model.KindMessageExternal) {
+			return
+		}
+		for _, text := range sent {
+			if takenFrom(label, text) {
+				bad("view: %s is named by an injection that is what the runtime sent the model", n.ID)
+			}
+		}
+	})
+	if len(want.Hide) > 0 {
+		hidden := map[string]bool{}
+		for _, name := range want.Hide {
+			hidden[name] = true
+		}
+		withheldBy := func(n *sessionview.Node) string {
+			for _, name := range n.Flags {
+				if hidden[name] {
+					return name
+				}
+			}
+			return ""
+		}
+		// What every withheld step said in the whole document, so the
+		// withheld one can be searched for it. A talk's label and reply are
+		// read from steps, and a step withheld must not come back as one.
+		// Both sides are trimmed, since a label is read trimmed and a step's
+		// text is not.
+		var said []string
+		eachNode(whole, func(n *sessionview.Node) {
+			if text := strings.TrimSpace(n.Text); text != "" && withheldBy(n) != "" {
+				said = append(said, text)
+			}
+		})
+		eachNode(doc, func(n *sessionview.Node) {
+			if name := withheldBy(n); name != "" && (n.Text != "" || n.State != model.ContentOmitted) {
+				bad("view: step %s carries %s and is not withheld: text %q, state %q", n.ID, name, n.Text, n.State)
+			}
+			if len(n.ProviderBodies) > 0 {
+				bad("view: call %s lists %d provider bodies while something is withheld", n.ID, len(n.ProviderBodies))
+			}
+			for _, shown := range []string{strings.TrimSpace(n.Label), strings.TrimSpace(n.Reply)} {
+				for _, text := range said {
+					if shown != "" && takenFrom(shown, text) {
+						bad("view: %s shows the text of a withheld step as its label or reply", n.ID)
+					}
+				}
+			}
+		})
+	}
+	if want.Withheld != nil {
+		for name := range want.Withheld {
+			// A misspelled name would read as a count of zero and pass.
+			if !sessiondata.IsWithholdable(name) && name != "provider_bodies" {
+				bad("view.withheld.%s is not a name a document counts under", name)
+			}
+		}
+		for name, n := range want.Withheld {
+			if doc.Summary.Withheld[name] != n {
+				bad("view.withheld.%s is %d, want %d", name, doc.Summary.Withheld[name], n)
+			}
+		}
+		for name, n := range doc.Summary.Withheld {
+			if _, listed := want.Withheld[name]; !listed {
+				bad("view.withheld.%s is %d, and the expectation lists nothing for it", name, n)
+			}
+		}
+	}
 	if want.State != "" && doc.Summary.State != want.State {
 		bad("view.state is %s (%v), want %s", doc.Summary.State, doc.Summary.Problems, want.State)
 	}
@@ -575,6 +673,23 @@ func checkView(root, session string, want *View) ([]string, error) {
 	}
 	if want.CapturedPrompts != nil && doc.Summary.CapturedPrompts != *want.CapturedPrompts {
 		bad("view.captured_prompts is %d, want %d", doc.Summary.CapturedPrompts, *want.CapturedPrompts)
+	}
+	if want.Flags != nil {
+		got := map[string]int{}
+		eachNode(doc, func(n *sessionview.Node) {
+			for _, name := range n.Flags {
+				got[name]++
+			}
+		})
+		for name, n := range want.Flags {
+			// A misspelled name would read as a count of zero and pass.
+			if !knownFlag(name) {
+				bad("view.flags.%s is not a flag a record carries", name)
+			}
+			if got[name] != n {
+				bad("view.flags.%s is %d, want %d", name, got[name], n)
+			}
+		}
 	}
 	if want.Executions != nil && len(doc.ToolExecutions) != *want.Executions {
 		bad("view.executions is %d, want %d", len(doc.ToolExecutions), *want.Executions)
@@ -904,6 +1019,58 @@ func stamp(s string) time.Time {
 func sorted(m map[string]int) map[string]int        { return m }
 func sortedS(m map[string]string) map[string]string { return m }
 func sortedN(m map[string]*Node) map[string]*Node   { return m }
+
+// eachNode calls fn on every node of a document's trees, talks and loose
+// alike, parents before their children.
+func eachNode(doc *sessionview.Conversation, fn func(*sessionview.Node)) {
+	var walk func([]sessionview.Node)
+	walk = func(nodes []sessionview.Node) {
+		for i := range nodes {
+			fn(&nodes[i])
+			walk(nodes[i].Children)
+		}
+	}
+	walk(doc.Talks)
+	walk(doc.Loose)
+}
+
+// knownFlag reports whether a name is a flag a record carries: one the index
+// reads back, or one a reader may withhold. Session Data lists the same.
+func knownFlag(name string) bool {
+	if sessiondata.IsWithholdable(name) {
+		return true
+	}
+	for bit := index.Flags(1); bit != 0; bit <<= 1 {
+		if index.FlagName(bit) == name {
+			return true
+		}
+	}
+	return false
+}
+
+// takenFrom reports whether a label or a reply was read from a step's text,
+// both trimmed. Each is the text cut to a budget, from a text that may start
+// differently, so one that is a long start of the other counts too. One that
+// only contains a short text, such as a reply that repeats a few words of
+// it, was not read from it.
+func takenFrom(label, text string) bool {
+	const enough = 32
+	return label == text || len(label) >= enough && strings.HasPrefix(text, label) ||
+		len(text) >= enough && strings.HasPrefix(label, text)
+}
+
+// holdsKind reports whether a node or any node under it is of a kind.
+func holdsKind(n *sessionview.Node, kind string) bool {
+	if n.Kind == kind {
+		return true
+	}
+	for i := range n.Children {
+		if holdsKind(&n.Children[i], kind) {
+			return true
+		}
+	}
+	return false
+}
 
 // Properties over the landed records themselves.
 
